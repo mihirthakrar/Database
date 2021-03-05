@@ -1,0 +1,231 @@
+from json import loads
+from datetime import datetime
+from time import sleep
+import csv
+import time
+from multiprocessing import Pool
+import glob
+import os
+import sys
+import pytz
+from pymongo import MongoClient
+import ssl 
+import cx_Oracle
+import pandas as pd
+import numpy as np
+import smtplib
+
+from bson.codec_options import CodecOptions
+
+
+
+sys.path.append(os.path.join(sys.path[0],'config'))
+op=__import__(sys.argv[1])
+log=op.TABLE + ".log"
+sys.stdout=open(log,'w')
+
+def oracle_fetch_full():
+
+    connection = cx_Oracle.connect(op.username,op.password,op.dsn_tns) 
+    col=[]
+    for keys,value in op.attr.items():
+         colvalue='''{} as "{}"'''.format(keys,value)
+         col.append(colvalue)
+    
+    col=','.join(col)
+    comparetime = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    print("Table : %s.%s , Collection : %s.%s, Timestamp : %s" %(op.OWNER,op.TABLE,op.mongodb,op.mongocollection,comparetime)) 
+    o_query="""select {} from {}.{} where LAST_UPDATE_DT <= to_date('{}','dd/mm/yyyy hh24:mi:ss') and {}""".format(col,op.OWNER,op.TABLE,comparetime,op.search_cond)
+    df_oracle=pd.read_sql(o_query,con=connection,chunksize=120000)
+#    df_oracle=pd.read_sql(o_query,con=connection)
+    return df_oracle,comparetime
+ 
+def oracle_fetch_inc(starttime):
+
+    connection = cx_Oracle.connect(op.username,op.password,op.dsn_tns)
+    col=[]
+    for keys,value in op.attr.items():
+         colvalue='''{} as "{}"'''.format(keys,value)
+         col.append(colvalue)
+   
+    col=','.join(col)
+    comparetime = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    print("\nTable : %s.%s , Collection : %s.%s, Timestamp : %s" %(op.OWNER,op.TABLE,op.mongodb,op.mongocollection,comparetime))
+    o_query="""select {} from {}.{} where LAST_UPDATE_DT > to_date('{}','dd/mm/yyyy hh24:mi:ss') and {}""".format(col,op.OWNER,op.TABLE,starttime,op.search_cond)
+    df_oracle=pd.read_sql(o_query,con=connection,chunksize=120000)
+#    df_oracle=pd.read_sql(o_query,con=connection)
+    return df_oracle
+
+
+
+
+def mongo_fetch(df_oracle) : 
+
+    client = MongoClient(op.mongouri,ssl=True,ssl_cert_reqs=ssl.CERT_NONE,j=True,w=1)
+    mongodb= client[op.mongodb]
+    mongoworkspace=mongodb[op.mongocollection]
+    oracle_total=0
+    mongo_total=0 
+    diff_cnt = 0
+    diff = pd.Series([])
+#    aware_times = mongoworkspace.with_options(codec_options=CodecOptions(tz_aware=True,tzinfo=pytz.timezone('UTC')))
+    df_oracle=df_oracle.rename(columns=str.lower)
+    o_pk=list(df_oracle[op.pk])
+    projection={}  
+    cols=[]
+    for keys,value in op.attr.items():
+           projection[value]=1
+
+    projection['_id']=0
+    pd.set_option('display.max_columns', None)
+    if bool(op.m_array) : 
+         m_query={op.pk: { "$in" : o_pk}}
+         df_pk=pd.DataFrame(o_pk)
+         m_array="$"+op.m_array
+         pipeline=[{"$match" : m_query },{"$project": projection},{ "$unwind" : { "path" : m_array}},{"$match" : m_query }] 
+         df1=pd.json_normalize(list(mongoworkspace.aggregate(pipeline)))
+    else : 
+         m_query={op.pk: { "$in" : o_pk}} 
+         df1=pd.DataFrame(list(mongoworkspace.find(m_query,projection)))
+
+
+    for member in df_oracle.columns :
+          if member not in df1.columns :
+                df1[member]='None'
+          else :
+                continue
+
+
+
+       
+    """ To compare timezone , mongoworkspace object should be converted as follows """
+    oracle_cnt=df_oracle.shape[0]
+    df1=df1.replace(r'^\s*$','None', regex=True)
+    df1=df1.replace({np.nan: None })
+    df1.drop_duplicates(subset=op.pk,keep= "first", inplace= True)
+    mongo_cnt=df1.shape[0]
+    diff_filename="diff_"+ op.TABLE+".csv"
+    pd.set_option('display.max_columns', None)
+    which='None'
+ 
+    """Find rows which are different between two DataFrames."""
+    if mongo_cnt == 0 : 
+         df_oracle['tmp']=1
+         df1['tmp']=1 
+         comparison_df = df_oracle.merge(df1,indicator=True,how='outer',on=['tmp']) 
+         comparison_df = comparison_df.drop(['tmp'],axis=1)
+    else : 
+         for attr in op.dt_attr:
+#              df1.loc[(df1[attr] != 'None'),attr]=df1.loc[(df1[attr] != 'None'),attr].astype(str).str[:19]
+#              df1.loc[(df1[attr] != 'None'),attr]=df1.loc[(df1[attr] != 'None'),attr].dt.strftime('%Y-%m-%d %H:%M:%S')
+#              df1.loc[df1[attr].str.contains('1500-'),attr]=df1.loc[df1[attr].str.contains('1500-'),attr].apply(lambda x:'1500-01-01')
+              df_oracle.loc[df_oracle[attr].str.contains('1500-',na=False),attr]='1500-01-01'
+#              df1.loc[(df1[attr] > pd.Timestamp(1900,1,1)),attr]=df1.loc[(df1[attr] > pd.Timestamp(1900,1,1)),attr].dt.strftime('%Y-%m-%d %H:%M:%S')
+              df1.loc[(df1[attr] > pd.Timestamp(1900,1,1)),attr]=df1.loc[(df1[attr] > pd.Timestamp(1900,1,1)),attr].apply(lambda x:x.strftime('%Y-%m-%d %H:%M:%S'))
+              df1[attr]=df1[attr].astype(str) 
+              df1.loc[df1[attr].str.contains('1500-'),attr]=df1.loc[df1[attr].str.contains('1500-'),attr].apply(lambda x:'1500-01-01')
+#              df1.loc[df1[attr].str.contains('1500-',na=False),attr]='1500-01-01'
+
+         df_oracle=df_oracle.replace(r'^\s*$','None', regex=True)
+         df_oracle=df_oracle.replace({np.nan: None })
+          
+         df1=df1.astype(str)
+         df_oracle=df_oracle.astype(str)
+         comparison_df = df_oracle.merge(df1,indicator=True,how='outer')
+    diff_df = comparison_df[comparison_df['_merge']!='both']
+    diff_pk = pd.unique(diff_df[op.pk]) 
+    diff_cnt=len(diff_pk)
+    diff_pk=pd.DataFrame(diff_pk)
+    if not os.path.isfile(diff_filename):
+           diff_df.to_csv(diff_filename,mode='a',header=True)
+    else: # else it exists so append without mentioning the header
+           diff_df.to_csv(diff_filename, mode='a', header=False) 
+    
+    print("\nChunk: Oracle:%d,Mongo:%d,Diff:%d"  %(oracle_cnt,mongo_cnt,diff_cnt))
+        
+                 
+    diff_result = "diff_"+op.TABLE+"_pk.csv"
+    diff_pk.to_csv(diff_result,mode='a',index=False,header=False) 
+#    logname='Summary_'+op.TABLE+'.txt'
+#    summary = """End of file:{},Total:Oracle -->{},Mongo -->{},Diff -->{}\n""".format(filename,oracle_total,mongo_total,diff_cnt) 
+#    with open(logname,'a') as file1:
+#       file1.writelines(summary)
+#    print("End of file:%s,Total: Oracle -->%d,Mongo --> %d,Diff --> %d" %(filename,oracle_total,mongo_total,diff_cnt))
+    return oracle_cnt,mongo_cnt,diff_cnt
+
+
+
+if __name__=="__main__" :
+
+   try:
+
+     NUM_CORES=1
+     i=0
+     oracle=0
+     mongo=0
+     diff=0
+     start_time=time.time()
+
+     df_oracle,comparetime=oracle_fetch_full()
+
+     for chunk in df_oracle : 
+               df_chunks = np.array_split(chunk ,NUM_CORES)
+               with Pool(NUM_CORES) as p:
+                         result=p.map(mongo_fetch,df_chunks)
+                         result=list(result)
+                         for member in result : 
+                                oracle = member[0] + oracle       
+                                mongo = member[1] + mongo
+                                diff = member[2] + diff
+
+                         p.close()
+                         p.join()
+
+     end_time=time.time() 
+     print("\nFull : Oracle-->%d,Mongo--> %d,Diff --> %d,Elap-->%s seconds" %(oracle,mongo,diff,format((end_time - start_time),'.2f')))
+
+   finally : 
+     start_time=time.time()
+     df_oracle=oracle_fetch_inc(comparetime)
+
+     oracle=0
+     mongo=0
+     diff=0
+
+
+     for chunk in df_oracle :
+               df_chunks = np.array_split(chunk ,NUM_CORES)
+               with Pool(NUM_CORES) as p:
+                         result=p.map(mongo_fetch,df_chunks)
+                         result=list(result)
+                         for member in result :
+                                oracle = member[0] + oracle
+                                mongo = member[1] + mongo
+                                diff = member[2] + diff
+
+                         p.close()
+                         p.join()
+     comparetime = datetime.now().strftime("%d/%m/%Y %H:%M:%S") 
+     end_time=time.time()
+
+     print("\nINC : Oracle-->%d,Mongo--> %d,Diff --> %d,Elap-->%s seconds" %(oracle,mongo,diff,format((end_time - start_time),'.2f')))
+
+# Email notification
+     sys.stdout.close()
+     fromaddr = ""
+     toaddrs = ""
+
+     with open(log) as fp:
+         line=fp.read()
+     msg = ("From: %s\r\nTo: %s\r\n\r\n" % (fromaddr, toaddrs))
+
+     msg = msg + line
+     server = smtplib.SMTP('localhost')
+     server.sendmail(fromaddr, toaddrs, msg)
+     server.quit()
+
+  
+exit  
+
+
+     
